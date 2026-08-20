@@ -1,0 +1,597 @@
+# coding=utf-8
+"""Multi-table TableRAG agent for DataBench."""
+
+from __future__ import annotations
+
+import ast
+import json
+import os
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+import pandas as pd
+
+from agent.rag_agent import TableRAGAgent
+from utils.execute import parse_code_from_string, python_repl_ast
+from utils.utils import infer_dtype, is_numeric, read_json
+from prompts.wtq import tablerag_multi_cmoney_solve_table_prompt
+
+
+def unique_keep_order(values: list[str]) -> list[str]:
+    seen = set()
+    output = []
+
+    for value in values:
+        if value not in seen:
+            seen.add(value)
+            output.append(value)
+
+    return output
+
+
+def format_databench_answer(value: Any) -> str:
+    """Convert parsed JSON answer to DataBench response text."""
+
+    if isinstance(value, bool):
+        return "True" if value else "False"
+
+    if isinstance(value, list):
+        return json.dumps(
+            value,
+            ensure_ascii=False,
+            separators=(", ", ": "),
+        )
+
+    if value is None:
+        return ""
+
+    return str(value).strip()
+
+
+class TableRAGMultiAgent(TableRAGAgent):
+    def __init__(
+        self,
+        candidate_k: int = 10,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        self.candidate_k = candidate_k
+
+    def generate_query_list(
+        self,
+        prompt: str,
+        remove_numeric: bool = False,
+        max_attempt: int = 3,
+    ) -> list[str]:
+        """Generate query expansion once for all candidate tables."""
+
+        for _ in range(max_attempt):
+            text = self.query(prompt)
+
+            try:
+                start = text.find("[")
+                end = text.rfind("]") + 1
+
+                if start < 0 or end <= start:
+                    raise ValueError(
+                        f"No JSON list found: {text}"
+                    )
+
+                queries = read_json(text[start:end])
+
+                if not isinstance(queries, list):
+                    raise TypeError(
+                        "Expansion output is not a list."
+                    )
+
+                queries = [
+                    str(query).strip()
+                    for query in queries
+                    if str(query).strip()
+                ]
+
+                if remove_numeric:
+                    queries = [
+                        query
+                        for query in queries
+                        if not is_numeric(query)
+                    ]
+
+                return unique_keep_order(queries)
+
+            except Exception:
+                if self.verbose:
+                    print(
+                        "### Query expansion parse error:",
+                        text,
+                    )
+
+        return []
+
+    def retrieve_one_table(
+        self,
+        table_id: str,
+        df: pd.DataFrame,
+        column_queries: list[str],
+        cell_queries: list[str],
+    ) -> tuple[str, list[str], list[str]]:
+        """Run original TableRAG retrieval independently on one table."""
+
+        self.retriever.init_retriever(table_id, df)
+
+        schema_docs: list[str] = []
+
+        for query in column_queries:
+            schema_docs.extend(
+                self.retriever.retrieve_schema(query)
+            )
+
+        cell_docs: list[str] = []
+
+        for query in cell_queries:
+            cell_docs.extend(
+                self.retriever.retrieve_cell(query)
+            )
+
+        schema_docs = unique_keep_order(schema_docs)
+        cell_docs = unique_keep_order(cell_docs)
+
+        evidence_parts = [
+            "Schema Retrieval Queries: "
+            + ", ".join(column_queries),
+            "Schema Retrieval Results:",
+            "\n".join(schema_docs) if schema_docs else "(none)",
+            "",
+            "Cell Retrieval Queries: "
+            + ", ".join(cell_queries),
+            "Cell Retrieval Results:",
+            "\n".join(cell_docs) if cell_docs else "(none)",
+        ]
+
+        return (
+            "\n".join(evidence_parts),
+            schema_docs,
+            cell_docs,
+        )
+
+
+    @staticmethod
+    def parse_multi_final(
+        text: str,
+    ) -> tuple[dict[str, Any] | None, str]:
+        """Parse both labeled and bare multi-table final JSON."""
+
+        candidate = text.strip()
+        lower_candidate = candidate.lower()
+
+        # Standard expected format:
+        # Final Answer: {"table_source": "df2", "answer": true}
+        if "final answer:" in lower_candidate:
+            position = lower_candidate.rfind("final answer:")
+            candidate = candidate[
+                position + len("final answer:"):
+            ].splitlines()[0].strip()
+
+        # Be tolerant if the model explicitly writes Thought:
+        elif lower_candidate.startswith("thought:"):
+            candidate = candidate[
+                len("thought:"):
+            ].strip()
+
+        # Remove optional Markdown fences.
+        if candidate.startswith("```"):
+            candidate = candidate.strip("`").strip()
+
+            if candidate.lower().startswith("json"):
+                candidate = candidate[4:].strip()
+
+        payload = None
+
+        try:
+            payload = json.loads(candidate)
+        except json.JSONDecodeError:
+            try:
+                payload = ast.literal_eval(candidate)
+            except (ValueError, SyntaxError):
+                payload = None
+
+        if (
+            isinstance(payload, dict)
+            and "table_source" in payload
+            and "answer" in payload
+        ):
+            return payload, candidate
+
+        return None, candidate
+
+    def solver_loop_multi(
+        self,
+        dfs: dict[str, pd.DataFrame],
+        prompt: str,
+    ) -> tuple[
+        str,
+        str | None,
+        int,
+        str,
+        str,
+    ]:
+        """ReAct loop with df1 ... dfK available to Python."""
+
+        if self.verbose:
+            print(prompt, end="")
+
+        memory: dict[str, Any] = {}
+        n_iter = self.max_depth
+        solution = ""
+        init_prompt = prompt
+        text = ""
+
+        for i in range(self.max_depth):
+            solution += "Thought: "
+            current_prompt = init_prompt + solution
+
+            text = self.query(current_prompt).strip()
+            solution += text
+
+            if self.verbose:
+                print("Thought: " + text)
+
+            # gpt-5.6-sol may output the final JSON directly,
+            # without the literal "Final Answer:" prefix.
+            terminal_payload, _ = self.parse_multi_final(
+                text
+            )
+
+            if (
+                terminal_payload is not None
+                or self.is_terminal(text)
+            ):
+                n_iter = i + 1
+                break
+
+            if "Action:" not in text:
+                observation = "Error: no Action provided."
+
+            else:
+                code = parse_code_from_string(
+                    text.split("Action:")[-1].strip()
+                )
+
+                # GPT 偶爾會把整段 Python Action 包成字串。
+                # 例如 Action: "df2['Age'].mean()"
+                # 此時移除最外層引號後再執行真正的程式碼。
+                try:
+                    decoded_code = ast.literal_eval(code)
+
+                    if isinstance(decoded_code, str):
+                        code = decoded_code
+                except (ValueError, SyntaxError):
+                    pass
+
+                # Put df1...dfK in both globals and locals.
+                # This also supports list comprehensions.
+                execution_globals = {
+                    **globals(),
+                    **dfs,
+                    **memory,
+                }
+
+                observation, memory = python_repl_ast(
+                    code,
+                    custom_locals={**dfs},
+                    custom_globals=execution_globals,
+                    memory=memory,
+                )
+
+                if (
+                    isinstance(observation, str)
+                    and self.model.get_token_count(observation)
+                    > self.model.context_limit
+                ):
+                    observation = (
+                        "Observation is too long, "
+                        "we cannot query the API."
+                    )
+
+                if observation == "":
+                    observation = "success!"
+
+            if "\n" in str(observation):
+                observation = "\n" + str(observation)
+
+            solution += f"\nObservation: {observation}\n"
+
+            if self.verbose:
+                print(f"Observation: {observation}")
+
+        payload, raw_final = self.parse_multi_final(
+            text
+        )
+
+        table_source = None
+        answer_value: Any = raw_final
+
+        if payload is not None:
+            table_source = payload.get("table_source")
+            answer_value = payload.get("answer", "")
+
+        answer = format_databench_answer(answer_value)
+
+        return (
+            answer,
+            table_source,
+            n_iter,
+            solution,
+            raw_final,
+        )
+
+    def run(
+        self,
+        data: dict,
+        sc_id: int = 0,
+    ) -> dict:
+        log_path = os.path.join(
+            self.log_dir,
+            "log",
+            f'{data["id"]}-{sc_id}.json',
+        )
+
+        if os.path.exists(log_path) and self.load_exist:
+            with open(log_path, encoding="utf-8") as fp:
+                return json.load(fp)
+
+        if self.verbose:
+            print(
+                "=" * 25
+                + f' {data["id"]} '
+                + "=" * 25
+            )
+
+        query = data.get("statement", data["question"])
+        gold_table_id = data.get("gold_table_id")
+
+        candidates = data.get("candidate_tables", [])
+        candidates = candidates[:self.candidate_k]
+
+        if not candidates:
+            raise ValueError(
+                f'No candidate tables for {data["id"]}'
+            )
+
+        # Generate expansion only once per question.
+        column_prompt = self.get_prompt(
+            "extract_column_prompt",
+            table_caption="",
+            query=query,
+        )
+
+        column_queries = self.generate_query_list(
+            column_prompt,
+            remove_numeric=False,
+        )
+
+        cell_prompt = self.get_prompt(
+            "extract_cell_prompt",
+            table_caption="",
+            query=query,
+        )
+
+        cell_queries = self.generate_query_list(
+            cell_prompt,
+            remove_numeric=True,
+        )
+
+        dfs: dict[str, pd.DataFrame] = {}
+        source_map: dict[str, dict] = {}
+        evidence_sections: list[str] = []
+
+        all_retrieved_columns: dict[str, list[str]] = {}
+        all_retrieved_cells: dict[str, list[str]] = {}
+
+        for position, candidate in enumerate(
+            candidates,
+            start=1,
+        ):
+            df_name = f"df{position}"
+            table_id = str(candidate["table_id"])
+            table_path = Path(candidate["table_path"])
+            rank = int(candidate.get("rank", position))
+            score = candidate.get("score")
+
+            if not table_path.exists():
+                raise FileNotFoundError(
+                    f"Candidate table not found: {table_path}"
+                )
+
+            df = pd.read_parquet(table_path)
+            df = infer_dtype(df)
+
+            dfs[df_name] = df
+
+            source_map[df_name] = {
+                "df_name": df_name,
+                "rank": rank,
+                "table_id": table_id,
+                "title": candidate.get("title"),
+                "table_path": str(table_path),
+                "score": candidate.get("score"),
+                "bm25_score": candidate.get("bm25_score"),
+                "dense_score": candidate.get("dense_score"),
+                "n_rows": int(df.shape[0]),
+                "n_cols": int(df.shape[1]),
+            }
+
+            evidence, schema_docs, cell_docs = (
+                self.retrieve_one_table(
+                    table_id=table_id,
+                    df=df,
+                    column_queries=column_queries,
+                    cell_queries=cell_queries,
+                )
+            )
+
+            all_retrieved_columns[df_name] = schema_docs
+            all_retrieved_cells[df_name] = cell_docs
+
+            evidence_sections.append(
+                "\n".join(
+                    [
+                        "=" * 72,
+                        (
+                            f"Candidate {df_name} | "
+                            f"rank={rank} | "
+                            f"table_id={table_id}"
+                        ),
+                        "=" * 72,
+                        evidence,
+                    ]
+                )
+            )
+
+        candidate_table_map = "\n".join(
+            (
+                f'{df_name}: '
+                f'table_id={info["table_id"]} | '
+                f'title={info["title"]}'
+            )
+            for df_name, info in source_map.items()
+        )
+
+        table_evidence = "\n\n".join(evidence_sections)
+
+        dataset_name = str(data.get("dataset", "")).strip().lower()
+        is_cmoney = dataset_name == "cmoney"
+
+        if is_cmoney:
+            prompt = tablerag_multi_cmoney_solve_table_prompt.format(
+                query=query,
+                num_tables=len(dfs),
+                candidate_table_map=candidate_table_map,
+                table_evidence=table_evidence,
+            )
+        else:
+            prompt = self.get_prompt(
+                "solve_table_prompt",
+                query=query,
+                num_tables=len(dfs),
+                candidate_table_map=candidate_table_map,
+                table_evidence=table_evidence,
+            )
+
+        init_prompt_token_count = (
+            self.model.get_token_count(prompt)
+        )
+
+        (
+            answer,
+            table_source,
+            n_iter,
+            solution,
+            raw_final,
+        ) = self.solver_loop_multi(dfs, prompt)
+
+        selected_info = source_map.get(table_source)
+
+        selected_table_id = (
+            selected_info["table_id"]
+            if selected_info
+            else None
+        )
+
+        selected_rank = (
+            selected_info["rank"]
+            if selected_info
+            else None
+        )
+
+        candidate_table_ids = [
+            info["table_id"]
+            for info in source_map.values()
+        ]
+
+        result = {
+            "id": data["id"],
+            "sc_id": sc_id,
+            "query": query,
+            "answer": answer,
+            "label": data["label"],
+
+            "raw_final_answer": raw_final,
+            "table_source": table_source,
+            "selected_table_id": selected_table_id,
+            "selected_rank": selected_rank,
+            "gold_table_id": gold_table_id,
+            "selected_is_gold": (
+                selected_table_id == gold_table_id
+                if selected_table_id is not None
+                else False
+            ),
+            "gold_in_candidates": (
+                gold_table_id in candidate_table_ids
+                if gold_table_id is not None
+                else None
+            ),
+
+            "candidate_k": len(candidates),
+            "candidate_table_map": source_map,
+            "candidate_table_ids": candidate_table_ids,
+
+            "column_queries": column_queries,
+            "cell_queries": cell_queries,
+            "retrieved_columns": all_retrieved_columns,
+            "retrieved_cells": all_retrieved_cells,
+
+            "solution": solution,
+            "n_iter": n_iter,
+            "init_prompt_token_count":
+                init_prompt_token_count,
+
+            "input_token_count": getattr(
+                self,
+                "total_input_token_count",
+                0,
+            ),
+            "output_token_count": getattr(
+                self,
+                "total_output_token_count",
+                0,
+            ),
+            "total_token_count": getattr(
+                self,
+                "total_token_count",
+                (
+                    getattr(
+                        self,
+                        "total_input_token_count",
+                        0,
+                    )
+                    + getattr(
+                        self,
+                        "total_output_token_count",
+                        0,
+                    )
+                ),
+            ),
+        }
+
+        with open(
+            log_path,
+            "w",
+            encoding="utf-8",
+        ) as fp:
+            json.dump(
+                result,
+                fp,
+                ensure_ascii=False,
+                indent=4,
+            )
+
+        with open(
+            log_path.replace(".json", ".txt"),
+            "w",
+            encoding="utf-8",
+        ) as fp:
+            fp.write(prompt + solution)
+
+        return result

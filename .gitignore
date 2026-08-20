@@ -1,0 +1,22 @@
+# API keys / secrets
+az_key.py
+agent/gemini_key.py
+.env
+.env.*
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Backup files
+*.token_backup
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+
+# Local data / databases / experiment outputs
+data/
+db/
+output/
