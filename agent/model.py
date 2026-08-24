@@ -229,9 +229,9 @@ class Model:
         request_kwargs = dict(kwargs)
 
         # TableRAG already performs explicit external ReAct reasoning.
-        # Gemini 3 Flash supports reasoning_effort='none' in the OpenAI
-        # compatibility layer. For future non-Flash Gemini models, default
-        # to 'medium' unless GEMINI_REASONING_EFFORT overrides it.
+        # Gemini 3.7 Flash supports low / medium / high; use low by
+        # default so the experiment uses the model's lowest supported
+        # reasoning level unless GEMINI_REASONING_EFFORT overrides it.
         reasoning_effort = request_kwargs.pop(
             'reasoning_effort',
             None,
@@ -240,11 +240,23 @@ class Model:
         if reasoning_effort is None:
             reasoning_effort = os.getenv(
                 'GEMINI_REASONING_EFFORT',
-                'minimal',
+                'low',
             )
 
         if reasoning_effort:
             request_kwargs['reasoning_effort'] = reasoning_effort
+
+        model_name_lower = str(self.model_name).lower()
+
+        if 'gemini-3.7-flash' in model_name_lower:
+            # Gemini 3.7 Flash migration requirement:
+            # do not send deprecated sampling parameters.
+            request_kwargs.pop('temperature', None)
+            request_kwargs.pop('top_p', None)
+            request_kwargs.pop('top_k', None)
+
+            # TableRAG uses text-based external ReAct. It does not use
+            # Gemini/OpenAI API function calling.
 
         # Keep only non-empty stop sequences.
         stop = request_kwargs.get('stop')
@@ -257,11 +269,44 @@ class Model:
 
         client = self._get_gemini_openai_client()
 
-        return client.chat.completions.create(
+        response = client.chat.completions.create(
             model=self._normalize_gemini_model_name(),
             messages=messages,
             **request_kwargs,
         )
+
+        # Validate the response INSIDE the retried function.
+        # Gemini may occasionally return a completion with no message or
+        # no text content. Raising here makes Tenacity retry instead of
+        # letting a downstream AttributeError kill the worker.
+        choices = getattr(response, 'choices', None)
+
+        if not choices:
+            raise RuntimeError(
+                'Gemini returned no choices.'
+            )
+
+        choice = choices[0]
+        message = getattr(choice, 'message', None)
+        content = (
+            getattr(message, 'content', None)
+            if message is not None
+            else None
+        )
+
+        if not content:
+            finish_reason = getattr(
+                choice,
+                'finish_reason',
+                None,
+            )
+
+            raise RuntimeError(
+                'Gemini returned empty message/content; '
+                f'finish_reason={finish_reason}'
+            )
+
+        return response
 
     def query_gemini(
         self,
@@ -270,6 +315,27 @@ class Model:
         rate_limit_per_minute=None,
         **kwargs,
     ):
+        # Gemini 3.7 is strongly tool-oriented and can misinterpret the
+        # original TableRAG ReAct text protocol as native function calling.
+        # TableRAG does NOT use API tools here: Action is plain text that the
+        # local solver parses and executes itself.
+        if (
+            system is None
+            and 'gemini-3.7-flash' in str(self.model_name).lower()
+        ):
+            system = (
+                "Use plain-text response mode only. "
+                "Do not emit native tool calls or function calls. "
+                "The terms Thought:, Action:, Observation:, and "
+                "python_repl_ast in the user prompt are plain-text protocol "
+                "markers, not API tools. "
+                "When an Action is required, write `Action:` followed by one "
+                "single-line Python command as ordinary text. "
+                "The external TableRAG program will execute that text itself "
+                "and will append the Observation. "
+                "Never attempt to invoke python_repl_ast as a native function."
+            )
+
         if system is None:
             messages = [
                 {
@@ -320,9 +386,8 @@ class Model:
         if rate_limit_per_minute:
             time.sleep(60 / rate_limit_per_minute)
 
-        response_text = (
-            response.choices[0].message.content or ''
-        )
+        # Already validated in query_gemini_with_retry().
+        response_text = response.choices[0].message.content
 
         return response_text
 
