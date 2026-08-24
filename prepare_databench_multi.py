@@ -479,7 +479,7 @@ def main() -> None:
     parser.add_argument(
         "--oracle-path",
         default=(
-            "data/"
+            "data/databench_test80/"
             "wtq_databench_oracle_all.jsonl"
         ),
     )
