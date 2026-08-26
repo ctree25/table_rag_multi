@@ -84,13 +84,14 @@ class TableAgent:
         )
 
         if (
-            estimated_input_token_count
+            estimated_input_token_count + self.max_tokens
             > self.model.context_limit
         ):
             return (
                 f"Prompt length -- "
-                f"{estimated_input_token_count} is too long, "
-                "we cannot query the API."
+                f"{estimated_input_token_count} + "
+                f"{self.max_tokens} output tokens exceeds "
+                f"context limit {self.model.context_limit}."
             )
 
         response_text = self.model.query(
@@ -123,7 +124,7 @@ class TableAgent:
             total_token_count = (
                 input_token_count + output_token_count
             )
-
+    
         self.total_input_token_count += input_token_count
         self.total_output_token_count += output_token_count
         self.total_token_count += total_token_count

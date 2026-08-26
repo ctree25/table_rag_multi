@@ -20,3 +20,4 @@ __pycache__/
 data/
 db/
 output/
+qwen35_vllm_test.log

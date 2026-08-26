@@ -63,8 +63,6 @@ def solve(args):
         return agent.run(data, sc_id=sc_id)
 
 
-
-
 def write_token_usage(log_dir):
     """Aggregate all completed per-question logs."""
     log_path = Path(log_dir) / "log"
@@ -81,31 +79,73 @@ def write_token_usage(log_dir):
                 # Ignore incomplete files if a process is writing.
                 continue
 
-    input_token_count = sum(
-        int(record.get("input_token_count", 0) or 0)
-        for record in records
-    )
-    output_token_count = sum(
-        int(record.get("output_token_count", 0) or 0)
-        for record in records
-    )
-    total_token_count = sum(
+    # ------------------------------------------------------------------
+    # Actual usage
+    #
+    # New Multi-table logs explicitly store actual_* fields.
+    # For old logs / non-Multi agents, fall back to the original fields.
+    # ------------------------------------------------------------------
+    actual_input_token_count = sum(
         int(
             record.get(
-                "total_token_count",
-                int(
-                    record.get(
-                        "input_token_count",
-                        0,
-                    )
-                    or 0
-                )
-                + int(
-                    record.get(
-                        "output_token_count",
-                        0,
-                    )
-                    or 0
+                "actual_input_token_count",
+                record.get("input_token_count", 0),
+            )
+            or 0
+        )
+        for record in records
+    )
+
+    actual_output_token_count = sum(
+        int(
+            record.get(
+                "actual_output_token_count",
+                record.get("output_token_count", 0),
+            )
+            or 0
+        )
+        for record in records
+    )
+
+    actual_total_token_count = (
+        actual_input_token_count
+        + actual_output_token_count
+    )
+
+    # ------------------------------------------------------------------
+    # Cached expansion usage
+    #
+    # Only Multi-table logs with query-expansion cache accounting have
+    # these fields. Old/non-Multi logs naturally contribute zero.
+    # ------------------------------------------------------------------
+    cached_input_token_count = sum(
+        int(record.get("cached_input_token_count", 0) or 0)
+        for record in records
+    )
+
+    cached_output_token_count = sum(
+        int(record.get("cached_output_token_count", 0) or 0)
+        for record in records
+    )
+
+    cached_total_token_count = (
+        cached_input_token_count
+        + cached_output_token_count
+    )
+
+    # ------------------------------------------------------------------
+    # No-cache-equivalent usage
+    #
+    # Prefer explicitly stored per-question values when available.
+    # For old logs, actual usage is the best backward-compatible fallback.
+    # ------------------------------------------------------------------
+    no_cache_equivalent_input_token_count = sum(
+        int(
+            record.get(
+                "no_cache_equivalent_input_token_count",
+                record.get(
+                    "actual_input_token_count",
+                    record.get("input_token_count", 0),
                 ),
             )
             or 0
@@ -113,11 +153,50 @@ def write_token_usage(log_dir):
         for record in records
     )
 
+    no_cache_equivalent_output_token_count = sum(
+        int(
+            record.get(
+                "no_cache_equivalent_output_token_count",
+                record.get(
+                    "actual_output_token_count",
+                    record.get("output_token_count", 0),
+                ),
+            )
+            or 0
+        )
+        for record in records
+    )
+
+    no_cache_equivalent_total_token_count = (
+        no_cache_equivalent_input_token_count
+        + no_cache_equivalent_output_token_count
+    )
+
     usage = {
         "num_results": len(records),
-        "input_token_count": input_token_count,
-        "output_token_count": output_token_count,
-        "total_token_count": total_token_count,
+
+        # Backward-compatible names: actual tokens consumed by this run.
+        "input_token_count": actual_input_token_count,
+        "output_token_count": actual_output_token_count,
+        "total_token_count": actual_total_token_count,
+
+        # Explicit actual usage.
+        "actual_input_token_count": actual_input_token_count,
+        "actual_output_token_count": actual_output_token_count,
+        "actual_total_token_count": actual_total_token_count,
+
+        # Tokens skipped because query expansion came from cache.
+        "cached_input_token_count": cached_input_token_count,
+        "cached_output_token_count": cached_output_token_count,
+        "cached_total_token_count": cached_total_token_count,
+
+        # Comparable theoretical usage with query-expansion cache disabled.
+        "no_cache_equivalent_input_token_count":
+            no_cache_equivalent_input_token_count,
+        "no_cache_equivalent_output_token_count":
+            no_cache_equivalent_output_token_count,
+        "no_cache_equivalent_total_token_count":
+            no_cache_equivalent_total_token_count,
     }
 
     usage_path = Path(log_dir) / "token_usage.json"
@@ -138,8 +217,6 @@ def write_token_usage(log_dir):
 
     # Atomic replacement prevents a half-written JSON file.
     os.replace(temporary_path, usage_path)
-
-
 
 
 def write_databench_responses(
@@ -211,35 +288,52 @@ def write_databench_responses(
 
 
 def main(
-    dataset_path = 'data/tabfact/test_sub_nosynth.jsonl',
-    model_name = 'gpt-3.5-turbo-0125',
-    agent_type = 'PyReAct',
-    retrieve_mode = 'embed',
-    embed_model_name = 'text-embedding-3-large',
-    log_dir = 'output/test',
-    db_dir = 'db/',
-    top_k = 5,
+    dataset_path='data/tabfact/test_sub_nosynth.jsonl',
+    model_name='gpt-3.5-turbo-0125',
+    agent_type='PyReAct',
+    retrieve_mode='embed',
+    embed_model_name='text-embedding-3-large',
+    log_dir='output/test',
+    db_dir='db/',
+    top_k=5,
     candidate_k=10,
-    sr = 0, # self-refine, deprecated
-    sc = 1, # self-consistency
-    max_encode_cell = 10000,
-    stop_at = -1,
-    resume_from = 0,
-    load_exist = True,
-    n_worker = 1,
-    max_depth = 5,
-    max_tokens = 128,
-    temperature = 0.8,
-    verbose = False,
+    sr=0,  # self-refine, deprecated
+    sc=1,  # self-consistency
+    max_encode_cell=10000,
+    stop_at=-1,
+    resume_from=0,
+    load_exist=True,
+    n_worker=1,
+    max_depth=5,
+    max_tokens=128,
+    temperature=0.8,
+    verbose=False,
 ):
     os.makedirs(os.path.join(log_dir, 'log'), exist_ok=True)
 
     # store the config
-    task = [task_name for task_name in ['tabfact', 'wtq', 'arcade', 'bird'] if task_name in dataset_path][0]
-    db_dir = os.path.join(db_dir, task + '_' + Path(dataset_path).stem)
+    task = [
+        task_name
+        for task_name in ['tabfact', 'wtq', 'arcade', 'bird']
+        if task_name in dataset_path
+    ][0]
+
+    db_dir = os.path.join(
+        db_dir,
+        task + '_' + Path(dataset_path).stem,
+    )
+
     config_path = os.path.join(log_dir, 'config.json')
     with open(config_path, 'w') as fp:
-        json.dump({key: value for key, value in locals().items() if key != 'fp'}, fp, indent=4)
+        json.dump(
+            {
+                key: value
+                for key, value in locals().items()
+                if key != 'fp'
+            },
+            fp,
+            indent=4,
+        )
 
     dataset = load_dataset(task, dataset_path, stop_at)
     if stop_at < 0:
@@ -260,22 +354,43 @@ def main(
         'max_depth': max_depth,
         'max_tokens': max_tokens,
         'temperature': temperature,
-        'verbose': verbose
+        'verbose': verbose,
     }
+
     if agent_type == "TableRAGMulti":
         agent_args["candidate_k"] = candidate_k
 
     results = []
+
     if n_worker == 1:
         for data in tqdm(dataset[resume_from:stop_at]):
-            for sc_id in tqdm(range(sc), position=1, leave=False):
-                result = solve((agent_args, data, sc_id))
+            for sc_id in tqdm(
+                range(sc),
+                position=1,
+                leave=False,
+            ):
+                result = solve(
+                    (agent_args, data, sc_id)
+                )
                 results.append(result)
                 write_token_usage(log_dir)
+
     else:
-        with tqdm(total=(stop_at - resume_from) * sc) as pbar:
-            with ProcessPoolExecutor(max_workers=n_worker) as executor:
-                futures = [executor.submit(solve, (agent_args, data, sc_id)) for data in dataset[resume_from:stop_at] for sc_id in range(sc)]
+        with tqdm(
+            total=(stop_at - resume_from) * sc
+        ) as pbar:
+            with ProcessPoolExecutor(
+                max_workers=n_worker
+            ) as executor:
+                futures = [
+                    executor.submit(
+                        solve,
+                        (agent_args, data, sc_id),
+                    )
+                    for data in dataset[resume_from:stop_at]
+                    for sc_id in range(sc)
+                ]
+
                 for future in as_completed(futures):
                     pbar.update(1)
                     result = future.result()
@@ -283,6 +398,7 @@ def main(
                     write_token_usage(log_dir)
 
     write_token_usage(log_dir)
+
     if "databench" in dataset_path.lower():
         if sc != 1:
             raise ValueError(
@@ -301,26 +417,124 @@ def main(
 
     acc = evaluate(task, results)
     print(f'Accuracy: {acc}')
+
+    # Report both actual and no-cache-equivalent token usage.
     stats_keys = [
         'n_iter',
         'init_prompt_token_count',
+
         'input_token_count',
         'output_token_count',
         'total_token_count',
+
+        'actual_input_token_count',
+        'actual_output_token_count',
+        'actual_total_token_count',
+
+        'cached_input_token_count',
+        'cached_output_token_count',
+        'cached_total_token_count',
+
+        'no_cache_equivalent_input_token_count',
+        'no_cache_equivalent_output_token_count',
+        'no_cache_equivalent_total_token_count',
     ]
-    stats_df = pd.DataFrame.from_records(results)[stats_keys]
-    print(stats_df.describe().to_string())
+
+    stats_df = pd.DataFrame.from_records(results)
+
+    # Backward compatibility for agents/logs that do not expose the
+    # explicit token-accounting fields.
+    stats_df['actual_input_token_count'] = stats_df.get(
+        'actual_input_token_count',
+        stats_df.get('input_token_count', 0),
+    )
+    stats_df['actual_output_token_count'] = stats_df.get(
+        'actual_output_token_count',
+        stats_df.get('output_token_count', 0),
+    )
+    stats_df['actual_total_token_count'] = (
+        stats_df['actual_input_token_count']
+        + stats_df['actual_output_token_count']
+    )
+
+    if 'cached_input_token_count' not in stats_df.columns:
+        stats_df['cached_input_token_count'] = 0
+    if 'cached_output_token_count' not in stats_df.columns:
+        stats_df['cached_output_token_count'] = 0
+
+    stats_df['cached_total_token_count'] = (
+        stats_df['cached_input_token_count']
+        + stats_df['cached_output_token_count']
+    )
+
+    if 'no_cache_equivalent_input_token_count' not in stats_df.columns:
+        stats_df['no_cache_equivalent_input_token_count'] = (
+            stats_df['actual_input_token_count']
+            + stats_df['cached_input_token_count']
+        )
+
+    if 'no_cache_equivalent_output_token_count' not in stats_df.columns:
+        stats_df['no_cache_equivalent_output_token_count'] = (
+            stats_df['actual_output_token_count']
+            + stats_df['cached_output_token_count']
+        )
+
+    stats_df['no_cache_equivalent_total_token_count'] = (
+        stats_df['no_cache_equivalent_input_token_count']
+        + stats_df['no_cache_equivalent_output_token_count']
+    )
+
+    # Keep the old names explicitly aligned with actual usage.
+    stats_df['input_token_count'] = (
+        stats_df['actual_input_token_count']
+    )
+    stats_df['output_token_count'] = (
+        stats_df['actual_output_token_count']
+    )
+    stats_df['total_token_count'] = (
+        stats_df['actual_total_token_count']
+    )
+
+    print(
+        stats_df[stats_keys]
+        .describe()
+        .to_string()
+    )
 
     # store the result
-    result_dict = stats_df.mean().to_dict()
+    result_dict = (
+        stats_df[stats_keys]
+        .mean()
+        .to_dict()
+    )
     result_dict['accuracy'] = acc
-    for key in ['model_name', 'retrieve_mode', 'embed_model_name', 'task', 'agent_type', 'top_k', 'max_encode_cell', 'sr']:
+
+    for key in [
+        'model_name',
+        'retrieve_mode',
+        'embed_model_name',
+        'task',
+        'agent_type',
+        'top_k',
+        'max_encode_cell',
+        'sr',
+    ]:
         result_dict[key] = agent_args[key]
+
     result_dict['sc'] = sc
     result_dict['data'] = Path(dataset_path).stem
-    result_path = os.path.join(log_dir, 'result.json')
+
+    result_path = os.path.join(
+        log_dir,
+        'result.json',
+    )
+
     with open(result_path, 'w') as fp:
-        json.dump(result_dict, fp, indent=4)
+        json.dump(
+            result_dict,
+            fp,
+            indent=4,
+        )
 
 
 if __name__ == '__main__':
