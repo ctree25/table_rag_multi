@@ -63,6 +63,13 @@ class TableRAGMultiAgent(TableRAGAgent):
         super().__init__(**kwargs)
         self.candidate_k = candidate_k
 
+        # Token usage represented by query-expansion cache hits.
+        # Keep this separate from self.total_* so self.total_* means
+        # tokens actually consumed by this run.
+        self.cached_input_token_count = 0
+        self.cached_output_token_count = 0
+        self.cached_total_token_count = 0
+
     def generate_query_list(
         self,
         prompt: str,
@@ -162,6 +169,7 @@ class TableRAGMultiAgent(TableRAGAgent):
         names = [
             "total_input_token_count",
             "total_output_token_count",
+            "total_token_count",
             "total_reasoning_token_count",
             "total_api_token_count",
         ]
@@ -191,22 +199,41 @@ class TableRAGMultiAgent(TableRAGAgent):
         usage_delta: dict[str, Any],
     ) -> None:
         """
-        Re-add the token usage from the original expansion generation.
+        Record token usage represented by a query-expansion cache hit.
 
-        This keeps experiment token accounting comparable even though the
-        cached run does not actually call the LLM again.
+        self.total_* is intentionally left untouched so it reflects tokens
+        actually consumed by this run. cached_* is added later to report
+        the no-cache-equivalent token cost.
         """
         if not isinstance(usage_delta, dict):
             return
 
-        for name, delta in usage_delta.items():
-            current = getattr(agent, name, None)
+        input_delta = int(
+            usage_delta.get(
+                "total_input_token_count",
+                0,
+            ) or 0
+        )
+        output_delta = int(
+            usage_delta.get(
+                "total_output_token_count",
+                0,
+            ) or 0
+        )
 
-            if (
-                isinstance(current, (int, np.integer))
-                and isinstance(delta, (int, np.integer))
-            ):
-                setattr(agent, name, int(current) + int(delta))
+        # Backward compatibility: old cache files may not have total count.
+        total_delta = usage_delta.get(
+            "total_token_count",
+            None,
+        )
+        if total_delta is None:
+            total_delta = input_delta + output_delta
+        else:
+            total_delta = int(total_delta or 0)
+
+        agent.cached_input_token_count += input_delta
+        agent.cached_output_token_count += output_delta
+        agent.cached_total_token_count += total_delta
 
     def generate_query_list_cached(
         self,
@@ -732,6 +759,37 @@ class TableRAGMultiAgent(TableRAGAgent):
                 table_evidence=table_evidence,
             )
 
+        # Qwen3.5 needs a stricter ReAct-format instruction.
+        if "qwen3.5" in str(
+            getattr(self, "model_name", "")
+        ).lower():
+            qwen_react_instruction = (
+                "Keep each Thought brief.\n"
+                "After each Thought, do exactly one of the following:\n"
+                "1. If more inspection or computation is needed, output exactly "
+                "one Action line containing only raw Python code.\n"
+                "2. If you already know the answer, output the Final Answer "
+                "directly and do NOT output an Action.\n"
+                "Do NOT write python_repl_ast(...); the system will execute "
+                "the Action automatically.\n"
+                "Do NOT put Python code inside quotes.\n"
+                "Do NOT put the final JSON in an Action line.\n"
+                "Do NOT use an Action merely to print or restate a known answer.\n"
+                "For example, when computation is needed, write: "
+                "Action: df6['age'].mean()\n"
+                'When finished, write: Final Answer: '
+                '{"table_source": "df6", "answer": true}\n\n'
+            )
+
+            marker = "Strictly follow this interaction format:"
+
+            if marker in prompt:
+                prompt = prompt.replace(
+                    marker,
+                    qwen_react_instruction + marker,
+                    1,
+                )
+
         init_prompt_token_count = (
             self.model.get_token_count(prompt)
         )
@@ -762,6 +820,45 @@ class TableRAGMultiAgent(TableRAGAgent):
             info["table_id"]
             for info in source_map.values()
         ]
+
+        # Actual usage: tokens really consumed by this run.
+        actual_input_token_count = int(
+            getattr(self, "total_input_token_count", 0)
+        )
+        actual_output_token_count = int(
+            getattr(self, "total_output_token_count", 0)
+        )
+        actual_total_token_count = (
+            actual_input_token_count
+            + actual_output_token_count
+        )
+
+        # Cached usage: expansion tokens skipped due to disk-cache hits.
+        cached_input_token_count = int(
+            getattr(self, "cached_input_token_count", 0)
+        )
+        cached_output_token_count = int(
+            getattr(self, "cached_output_token_count", 0)
+        )
+        cached_total_token_count = (
+            cached_input_token_count
+            + cached_output_token_count
+        )
+
+        # No-cache equivalent: theoretical cost if cached expansions
+        # had been generated again by the LLM.
+        no_cache_equivalent_input_token_count = (
+            actual_input_token_count
+            + cached_input_token_count
+        )
+        no_cache_equivalent_output_token_count = (
+            actual_output_token_count
+            + cached_output_token_count
+        )
+        no_cache_equivalent_total_token_count = (
+            no_cache_equivalent_input_token_count
+            + no_cache_equivalent_output_token_count
+        )
 
         result = {
             "id": data["id"],
@@ -800,32 +897,25 @@ class TableRAGMultiAgent(TableRAGAgent):
             "init_prompt_token_count":
                 init_prompt_token_count,
 
-            "input_token_count": getattr(
-                self,
-                "total_input_token_count",
-                0,
-            ),
-            "output_token_count": getattr(
-                self,
-                "total_output_token_count",
-                0,
-            ),
-            "total_token_count": getattr(
-                self,
-                "total_token_count",
-                (
-                    getattr(
-                        self,
-                        "total_input_token_count",
-                        0,
-                    )
-                    + getattr(
-                        self,
-                        "total_output_token_count",
-                        0,
-                    )
-                ),
-            ),
+            # Backward-compatible fields now mean actual usage.
+            "input_token_count": actual_input_token_count,
+            "output_token_count": actual_output_token_count,
+            "total_token_count": actual_total_token_count,
+
+            "actual_input_token_count": actual_input_token_count,
+            "actual_output_token_count": actual_output_token_count,
+            "actual_total_token_count": actual_total_token_count,
+
+            "cached_input_token_count": cached_input_token_count,
+            "cached_output_token_count": cached_output_token_count,
+            "cached_total_token_count": cached_total_token_count,
+
+            "no_cache_equivalent_input_token_count":
+                no_cache_equivalent_input_token_count,
+            "no_cache_equivalent_output_token_count":
+                no_cache_equivalent_output_token_count,
+            "no_cache_equivalent_total_token_count":
+                no_cache_equivalent_total_token_count,
         }
 
         with open(

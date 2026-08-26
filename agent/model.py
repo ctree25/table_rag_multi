@@ -139,7 +139,10 @@ class Model:
             return int(
                 os.getenv('GEMINI_CONTEXT_LIMIT', '1048576')
             )
-
+        elif 'qwen3.5' in str(model_name).lower():
+            return int(
+                os.getenv('VLLM_CONTEXT_LIMIT', '262144')
+            )
         elif 'Mistral-Nemo' in model_name:
             return 128000
 
@@ -383,6 +386,18 @@ class Model:
             'total_token_count': total_token_count,
         }
 
+        finish_reason = response.choices[0].finish_reason
+
+        if finish_reason == "length":
+            print(
+                f"[WARNING] Generation hit max_tokens "
+                f"finish_reason=length, "
+                f"max_tokens={kwargs.get('max_tokens')}"
+            )
+
+        response_text = (
+            response.choices[0].message.content or ""
+        )
         if rate_limit_per_minute:
             time.sleep(60 / rate_limit_per_minute)
 
