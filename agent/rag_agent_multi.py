@@ -447,9 +447,14 @@ class TableRAGMultiAgent(TableRAGAgent):
         # Final Answer: {"table_source": "df2", "answer": true}
         if "final answer:" in lower_candidate:
             position = lower_candidate.rfind("final answer:")
-            candidate = candidate[
+            remainder = candidate[
                 position + len("final answer:"):
-            ].splitlines()[0].strip()
+            ].strip()
+
+            if not remainder:
+                return None, ""
+
+            candidate = remainder.splitlines()[0].strip()
 
         # Be tolerant if the model explicitly writes Thought:
         elif lower_candidate.startswith("thought:"):
@@ -509,7 +514,17 @@ class TableRAGMultiAgent(TableRAGAgent):
             solution += "Thought: "
             current_prompt = init_prompt + solution
 
-            text = self.query(current_prompt).strip()
+            try:
+                text = self.query(current_prompt).strip()
+            except RuntimeError as exc:
+                if "finish_reason=malformed_function_call" not in str(exc):
+                    raise
+
+                print(
+                    "[Gemini] malformed_function_call after retries; "
+                    "counting this generation as an empty final answer."
+                )
+                text = "Final Answer:"
             solution += text
 
             if self.verbose:
