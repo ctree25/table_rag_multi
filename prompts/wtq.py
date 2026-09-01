@@ -42,23 +42,45 @@ Begin!
 '''
 
 tablerag_extract_column_prompt = '''
-Given a large table, I want to answer a question: {query}
-Since I cannot view the table directly, please suggest some column names that might contain the necessary data to answer this question.
-Please answer with a list of column names in JSON format without any additional explanation.
+
+Given a CMoney table with Traditional Chinese column names, I want to answer a question: {query}
+
+Since I cannot view the table directly, please suggest some column names or short column-name phrases that might contain the necessary data to answer this question.
+
+Important:
+- Prefer Traditional Chinese terms that are likely to appear directly in the table schema.
+- Do not translate Chinese concepts into English.
+- Keep abbreviations, ticker symbols, currency codes, or technical terms from the question when they may appear directly in the schema, such as EPS, JPY, USD.
+- Use concise column-like terms rather than full sentences.
+
+Please answer with a list in JSON format without any additional explanation.
+
 Example:
-["column1", "column2", "column3"]
+
+["日期", "代號", "名稱", "收盤價", "成交量"]
+
 '''
 
 tablerag_extract_cell_prompt = '''
-Given a large table, I want to answer a question: {query}
-Please extract some keywords which might appear in the table cells and help answer the question.
-The keywords should be categorical values rather than numerical values.
-The keywords should be contained in the question.
-Please answer with a list of keywords in JSON format without any additional explanation.
-Example:
-["keyword1", "keyword2", "keyword3"]
-'''
 
+Given a CMoney table, I want to answer a question: {query}
+
+Please extract some keywords from the question that might appear directly as values in the table cells and help answer the question.
+
+Important:
+- Keep the original wording and language used in the question whenever possible.
+- Do not translate Chinese keywords into English.
+- Keep abbreviations, ticker symbols, company names, currency codes, and other identifiers exactly as they appear in the question.
+- The keywords should be categorical or textual values rather than numerical values.
+- Do not include dates or other purely numerical values.
+
+Please answer with a list of keywords in JSON format without any additional explanation.
+
+Example:
+
+["日圓", "JPY"]
+
+'''
 tablerag_solve_table_prompt = '''
 You are working with a pandas dataframe in Python. The name of the dataframe is `df`. Your task is to use `python_repl_ast` to answer the question: {query}
 
@@ -188,7 +210,7 @@ Please answer the question: {query}.
 
 Begin!
 '''
-
+# CMoney Multi pandas
 tablerag_multi_cmoney_solve_table_prompt = '''
 You are working with {num_tables} candidate pandas dataframes in Python.
 The dataframe names are df1, df2, ..., df{num_tables}.
@@ -246,6 +268,7 @@ Final output requirements:
 Begin!
 '''
 
+# DataBench Oracle
 tablerag_databench_oracle_solve_table_prompt = '''
 You are working with a pandas dataframe in Python. The name of the dataframe is `df`. Your task is to use `python_repl_ast` to answer the question: {query}
 
@@ -281,6 +304,7 @@ Now, please use ``python_repl_ast` with the column names and cell values above t
 Begin!
 '''
 
+# CMoney Oracle pandas
 tablerag_cmoney_oracle_solve_table_prompt = '''
 You are working with a pandas dataframe in Python. The name of the dataframe is `df`. Your task is to use `python_repl_ast` to answer the question: {query}
 

@@ -79,27 +79,36 @@ class TableAgent:
 
     def query(self, prompt) -> str:
         # This estimate is used only for the context-length check.
-        estimated_input_token_count = (
-            self.model.get_token_count(prompt)
+        estimated_input_token_count = self.model.get_token_count(prompt)
+
+        # Leave a small safety margin because local tokenizer counting and
+        # vLLM request accounting can differ slightly.
+        context_margin = 64
+
+        available_output_tokens = (
+            self.model.context_limit
+            - estimated_input_token_count
+            - context_margin
         )
 
-        if (
-            estimated_input_token_count + self.max_tokens
-            > self.model.context_limit
-        ):
+        if available_output_tokens <= 0:
             return (
-                f"Prompt length -- "
-                f"{estimated_input_token_count} + "
-                f"{self.max_tokens} output tokens exceeds "
-                f"context limit {self.model.context_limit}."
+                f"Prompt length -- {estimated_input_token_count} input tokens "
+                f"leaves no room within context limit "
+                f"{self.model.context_limit}."
             )
+
+        effective_max_tokens = min(
+            self.max_tokens,
+            available_output_tokens,
+        )
 
         response_text = self.model.query(
             prompt=prompt,
             temperature=self.temperature,
             top_p=self.top_p,
             stop=self.stop_tokens,
-            max_tokens=self.max_tokens,
+            max_tokens=effective_max_tokens,
         )
 
         # Prefer the actual API usage returned by Azure/OpenAI or Vertex Gemini.

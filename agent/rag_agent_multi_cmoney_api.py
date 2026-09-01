@@ -55,7 +55,7 @@ class TableRAGMultiCMoneyAPIAgent(TableRAGMultiAgent):
         # owns Jina v3 dense retrieval.
         requested_retrieve_mode = str(kwargs.get("retrieve_mode", "hybrid"))
         requested_embed_model = str(
-            kwargs.get("embed_model_name", "jinaai/jina-embeddings-v3")
+            kwargs.get("embed_model_name", "jinaai/jina-embeddings-v4")
         )
         parent_kwargs = dict(kwargs)
         parent_kwargs["retrieve_mode"] = "bm25"
@@ -86,6 +86,45 @@ class TableRAGMultiCMoneyAPIAgent(TableRAGMultiAgent):
             encode_dim=schema_encode_dim,
             verbose=self.verbose,
         )
+
+    def _apply_qwen_sql_react_instruction(
+        self,
+        prompt: str,
+    ) -> str:
+        """Add the same Qwen3.5 ReAct protocol guard used by Multi pandas.
+
+        This changes only the interaction protocol. The SQL-API backend still
+        uses raw SELECT statements instead of Python Actions.
+        """
+        if "qwen3.5" not in str(
+            getattr(self, "model_name", "")
+        ).lower():
+            return prompt
+
+        qwen_react_instruction = (
+            "Keep each Thought brief.\n"
+            "After each Thought, do exactly one of the following:\n"
+            "1. If more inspection or computation is needed, output exactly "
+            "one Action line containing only one raw SELECT statement.\n"
+            "2. If you already know the answer, output the Final Answer "
+            "directly and do NOT output an Action.\n"
+            "Do NOT put SQL inside quotes or JSON.\n"
+            "Do NOT put the final JSON in an Action line.\n"
+            "Do NOT use an Action merely to repeat or reconfirm a value "
+            "that has already been returned successfully.\n"
+            "Once the answer is known, stop querying the database.\n\n"
+        )
+
+        marker = "Strictly follow this interaction format:"
+
+        if marker in prompt:
+            prompt = prompt.replace(
+                marker,
+                qwen_react_instruction + marker,
+                1,
+            )
+
+        return prompt
 
     @staticmethod
     def _strip_code_fence(text: str) -> str:
@@ -161,46 +200,98 @@ class TableRAGMultiCMoneyAPIAgent(TableRAGMultiAgent):
         sql: str,
         rows: list[dict[str, Any]],
         headers: list[str],
+        max_token_budget: int | None = None,
     ) -> str:
+        """
+        Format SQL result while respecting both:
+        1. the normal observation row/char limits
+        2. the remaining model context budget
+        """
+
         shown_rows = rows[: self.observation_max_rows]
-        payload: dict[str, Any] = {
-            "table": table_name,
-            "sql": sql,
-            "rows_count": len(rows),
-            "columns": headers,
-            "rows_shown": len(shown_rows),
-            "truncated": len(rows) > len(shown_rows),
-            "rows": shown_rows,
-        }
-        if payload["truncated"]:
-            payload["note"] = (
-                "Only a preview is shown. Issue a narrower SQL query or an "
-                "aggregate query before answering."
+
+        def build_payload(
+            current_rows: list[dict[str, Any]],
+        ) -> dict[str, Any]:
+            truncated = len(current_rows) < len(rows)
+
+            payload: dict[str, Any] = {
+                "rows_count": len(rows),
+                "columns": headers,
+                "rows_shown": len(current_rows),
+                "truncated": truncated,
+                "rows": current_rows,
+            }
+
+            if truncated:
+                payload["note"] = (
+                    "Only a preview is shown. Issue a narrower SQL query "
+                    "or an aggregate query before answering."
+                )
+
+            return payload
+
+        def fits(text: str) -> bool:
+            if len(text) > self.observation_max_chars:
+                return False
+
+            if (
+                max_token_budget is not None
+                and self.model.get_token_count(text) > max_token_budget
+            ):
+                return False
+
+            return True
+
+        current_rows = shown_rows
+
+        # Repeatedly reduce the row preview until both char and token
+        # budgets are satisfied.
+        while True:
+            payload = build_payload(current_rows)
+            text = json.dumps(
+                payload,
+                ensure_ascii=False,
+                default=str,
             )
 
-        text = json.dumps(payload, ensure_ascii=False, default=str)
-        if len(text) <= self.observation_max_chars:
+            if fits(text):
+                return text
+
+            if current_rows:
+                current_rows = current_rows[
+                    : len(current_rows) // 2
+                ]
+                continue
+
+            break
+
+        # Even headers/metadata may occasionally be too large.
+        payload = {
+            "rows_count": len(rows),
+            "rows_shown": 0,
+            "truncated": bool(rows),
+            "rows": [],
+            "note": (
+                "Result omitted because the remaining context is limited. "
+                "Issue a narrower SQL query or an aggregate query."
+            ),
+        }
+
+        text = json.dumps(
+            payload,
+            ensure_ascii=False,
+            default=str,
+        )
+
+        if fits(text):
             return text
 
-        # Reduce row preview until the observation fits. Keep metadata intact.
-        reduced = shown_rows
-        while reduced and len(text) > self.observation_max_chars:
-            reduced = reduced[: max(1, len(reduced) // 2)]
-            payload["rows"] = reduced
-            payload["rows_shown"] = len(reduced)
-            payload["truncated"] = True
-            payload["note"] = (
-                "Observation was truncated for context length. Issue a "
-                "narrower SQL query or aggregate in SQL."
-            )
-            text = json.dumps(payload, ensure_ascii=False, default=str)
-
-        if len(text) > self.observation_max_chars:
-            # Last resort: return headers/counts but no potentially cut JSON row.
-            payload["rows"] = []
-            payload["rows_shown"] = 0
-            text = json.dumps(payload, ensure_ascii=False, default=str)
-        return text
+        # Absolute last resort.
+        return (
+            '{"truncated":true,"rows":[],'
+            '"note":"Result omitted; issue a narrower SQL query."}'
+        )
 
     def _build_schema_evidence(
         self,
@@ -297,11 +388,41 @@ class TableRAGMultiCMoneyAPIAgent(TableRAGMultiAgent):
                             "headers": headers,
                         }
                     )
+                    # Reserve room for the next Thought/Action generation.
+                    # Normally preserve the configured max_tokens=512.
+                    context_margin = 64
+
+                    next_turn_without_observation = (
+                        init_prompt
+                        + solution
+                        + "\nObservation: "
+                        + "\nThought: "
+                    )
+
+                    used_tokens = self.model.get_token_count(
+                        next_turn_without_observation
+                    )
+
+                    available_observation_tokens = (
+                        self.model.context_limit
+                        - used_tokens
+                        - self.max_tokens
+                        - context_margin
+                    )
+
+                    # If the context is already very tight, still allow a tiny
+                    # observation. self.query() will dynamically reduce output tokens.
+                    available_observation_tokens = max(
+                        32,
+                        available_observation_tokens,
+                    )
+
                     observation = self._format_observation(
                         table_name=table_name,
                         sql=sql,
                         rows=rows,
                         headers=headers,
+                        max_token_budget=available_observation_tokens,
                     )
                     call_log["observation"] = observation
                 except Exception as exc:
@@ -328,10 +449,16 @@ class TableRAGMultiCMoneyAPIAgent(TableRAGMultiAgent):
 
         payload, raw_final = self.parse_multi_final(text)
         table_source = None
-        answer_value: Any = raw_final
+
         if payload is not None:
             table_source = payload.get("table_source")
-            answer_value = payload.get("answer", "")
+            answer_value: Any = payload.get("answer", "")
+        else:
+            # No valid Final Answer after max_depth:
+            # count this question as wrong instead of treating the last
+            # Thought/Action text as the answer.
+            raw_final = ""
+            answer_value = ""
 
         answer = format_databench_answer(answer_value)
         return answer, table_source, n_iter, solution, raw_final, api_calls
@@ -401,6 +528,11 @@ class TableRAGMultiCMoneyAPIAgent(TableRAGMultiAgent):
             candidate_table_map=candidate_table_map,
             table_evidence=table_evidence,
         )
+
+        prompt = self._apply_qwen_sql_react_instruction(
+            prompt
+        )
+
         init_prompt_token_count = self.model.get_token_count(prompt)
 
         (

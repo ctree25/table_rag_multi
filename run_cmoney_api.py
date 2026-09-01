@@ -1,17 +1,6 @@
-"""Run CMoney TableRAG from a precomputed table-retrieval JSONL.
-
-Example:
-python run_cmoney_api.py \
-  --retrieval_path=data/cmoney/retrieval_eval.jsonl \
-  --schema_path=data/cmoney/table_schema_20250122.csv \
-  --candidate_k=5 \
-  --schema_top_k=5 \
-  --model_name=gpt-4.1-mini \
-  --log_dir=output/cmoney_api_top5 \
-  --verbose=True
-"""
+"""Run CMoney TableRAG from a precomputed table-retrieval JSONL."""
 from __future__ import annotations
-
+import traceback
 import json
 import os
 from pathlib import Path
@@ -20,6 +9,7 @@ import fire
 from tqdm import tqdm
 
 from agent.rag_agent_multi_cmoney_api import TableRAGMultiCMoneyAPIAgent
+from agent.rag_agent_oracle_cmoney_api import TableRAGOracleCMoneyAPIAgent
 
 
 def load_retrieval_jsonl(
@@ -36,6 +26,7 @@ def load_retrieval_jsonl(
             line = line.strip()
             if not line:
                 continue
+
             try:
                 obj = json.loads(line)
             except json.JSONDecodeError as exc:
@@ -52,9 +43,15 @@ def load_retrieval_jsonl(
                 raise ValueError(
                     f"Missing question_id/query at {path}:{line_no}"
                 )
+
             if not isinstance(retrieved_tables, list):
                 raise ValueError(
                     f"retrieved_tables must be a list at {path}:{line_no}"
+                )
+
+            if not isinstance(gt_tables, list):
+                raise ValueError(
+                    f"gt_tables must be a list at {path}:{line_no}"
                 )
 
             candidates = [
@@ -62,12 +59,17 @@ def load_retrieval_jsonl(
                 for name in retrieved_tables[:candidate_k]
                 if str(name).strip()
             ]
+
             records.append(
                 {
                     "id": question_id,
                     "question_id": question_id,
                     "question": str(query),
-                    "gt_tables": [str(x) for x in gt_tables],
+                    "gt_tables": [
+                        str(x).strip()
+                        for x in gt_tables
+                        if str(x).strip()
+                    ],
                     "candidate_tables": candidates,
                     "retrieval_metadata": {
                         "first_gt_rank": obj.get("first_gt_rank"),
@@ -91,6 +93,7 @@ def write_predictions(results: list[dict], output_path: Path) -> None:
 def main(
     retrieval_path: str = "data/cmoney/retrieval_eval.jsonl",
     schema_path: str = "data/cmoney/table_schema_20250122.csv",
+    agent_type: str = "multi",
     candidate_k: int = 5,
     schema_top_k: int = 5,
     model_name: str = "gpt-4.1-mini",
@@ -114,7 +117,14 @@ def main(
     load_exist: bool = True,
     verbose: bool = False,
 ):
-    """Run schema-only retrieval and SQL-API reasoning for CMoney."""
+    """Run CMoney schema retrieval + SQL-API reasoning."""
+    agent_type = str(agent_type).strip().lower()
+
+    if agent_type not in {"multi", "oracle"}:
+        raise ValueError(
+            "agent_type must be either 'multi' or 'oracle'."
+        )
+
     os.makedirs(Path(log_dir) / "log", exist_ok=True)
     os.makedirs(db_dir, exist_ok=True)
 
@@ -122,13 +132,18 @@ def main(
         retrieval_path,
         candidate_k=candidate_k,
     )
+
     if stop_at < 0 or stop_at > len(dataset):
         stop_at = len(dataset)
+
+    effective_candidate_k = candidate_k if agent_type == "multi" else 1
 
     config = {
         "retrieval_path": retrieval_path,
         "schema_path": schema_path,
+        "agent_type": agent_type,
         "candidate_k": candidate_k,
+        "effective_candidate_k": effective_candidate_k,
         "schema_top_k": schema_top_k,
         "model_name": model_name,
         "retrieve_mode": retrieve_mode,
@@ -150,47 +165,165 @@ def main(
         "resume_from": resume_from,
         "load_exist": load_exist,
     }
+
     with (Path(log_dir) / "config.json").open("w", encoding="utf-8") as fp:
         json.dump(config, fp, ensure_ascii=False, indent=2)
 
-    agent = TableRAGMultiCMoneyAPIAgent(
-        schema_path=schema_path,
-        candidate_k=candidate_k,
-        schema_top_k=schema_top_k,
-        api_timeout=api_timeout,
-        observation_max_rows=observation_max_rows,
-        observation_max_chars=observation_max_chars,
-        schema_embed_device=schema_embed_device,
-        schema_embed_batch_size=schema_embed_batch_size,
-        schema_encode_dim=schema_encode_dim,
-        model_name=model_name,
-        retrieve_mode=retrieve_mode,
-        embed_model_name=embed_model_name,
-        # Keep task=wtq only for compatibility with the inherited base class.
-        # This agent imports its own CMoney solve prompt directly.
-        task="wtq",
-        agent_type="TableRAGMulti",
-        top_k=schema_top_k,
-        sr=0,
-        max_encode_cell=1,
-        temperature=temperature,
-        top_p=top_p,
-        stop_tokens=["Observation:"],
-        max_tokens=max_tokens,
-        max_depth=max_depth,
-        load_exist=load_exist,
-        log_dir=log_dir,
-        db_dir=db_dir,
-        verbose=verbose,
-    )
+    common_agent_kwargs = {
+        "schema_path": schema_path,
+        "schema_top_k": schema_top_k,
+        "api_timeout": api_timeout,
+        "observation_max_rows": observation_max_rows,
+        "observation_max_chars": observation_max_chars,
+        "schema_embed_device": schema_embed_device,
+        "schema_embed_batch_size": schema_embed_batch_size,
+        "schema_encode_dim": schema_encode_dim,
+        "model_name": model_name,
+        "retrieve_mode": retrieve_mode,
+        "embed_model_name": embed_model_name,
+        "task": "wtq",
+        "top_k": schema_top_k,
+        "sr": 0,
+        "max_encode_cell": 1,
+        "temperature": temperature,
+        "top_p": top_p,
+        "stop_tokens": ["Observation:"],
+        "max_tokens": max_tokens,
+        "max_depth": max_depth,
+        "load_exist": load_exist,
+        "log_dir": log_dir,
+        "db_dir": db_dir,
+        "verbose": verbose,
+    }
+
+    if agent_type == "multi":
+        agent = TableRAGMultiCMoneyAPIAgent(
+            candidate_k=candidate_k,
+            agent_type="TableRAGMulti",
+            **common_agent_kwargs,
+        )
+    else:
+        agent = TableRAGOracleCMoneyAPIAgent(
+            agent_type="TableRAGOracle",
+            **common_agent_kwargs,
+        )
 
     results: list[dict] = []
     subset = dataset[resume_from:stop_at]
+
     for data in tqdm(subset):
         for sc_id in range(sc):
-            result = agent.run(data, sc_id=sc_id)
-            # Preserve retrieval-file metadata in the aggregate JSONL.
-            result["retrieval_metadata"] = data.get("retrieval_metadata", {})
+            try:
+                result = agent.run(
+                    data,
+                    sc_id=sc_id,
+                )
+
+            except Exception as exc:
+                qid = data.get(
+                    "question_id",
+                    data.get("id"),
+                )
+
+                error_traceback = traceback.format_exc()
+
+                print(
+                    f"\n[ERROR] question_id={qid} "
+                    f"sc_id={sc_id}: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+                print("[ERROR] Count this question as wrong and continue.")
+
+                gt_tables = [
+                    str(x)
+                    for x in data.get("gt_tables", [])
+                ]
+
+                candidate_tables = [
+                    str(x)
+                    for x in data.get(
+                        "candidate_tables",
+                        [],
+                    )
+                ]
+
+                result = {
+                    "id": data.get("id", qid),
+                    "question_id": qid,
+                    "sc_id": sc_id,
+                    "query": str(
+                        data.get("question", "")
+                    ),
+
+                    # Failed question = wrong in exact-match evaluation.
+                    "answer": "",
+                    "raw_final_answer": "",
+                    "table_source": None,
+                    "selected_rank": None,
+
+                    "gt_tables": gt_tables,
+                    "selected_is_gold": False,
+                    "gold_in_candidates": any(
+                        table in candidate_tables
+                        for table in gt_tables
+                    ),
+
+                    "candidate_k": len(
+                        candidate_tables
+                    ),
+                    "candidate_tables": candidate_tables,
+
+                    "status": "error",
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                    "traceback": error_traceback,
+                }
+
+                # agent.run() did not finish, so it did not write
+                # its normal per-question log. Write one here.
+                log_path = (
+                    Path(log_dir)
+                    / "log"
+                    / f"{data.get('id', qid)}-{sc_id}.json"
+                )
+
+                log_path.parent.mkdir(
+                    parents=True,
+                    exist_ok=True,
+                )
+
+                with log_path.open(
+                    "w",
+                    encoding="utf-8",
+                ) as fp:
+                    json.dump(
+                        result,
+                        fp,
+                        ensure_ascii=False,
+                        indent=2,
+                    )
+
+                with log_path.with_suffix(
+                    ".txt"
+                ).open(
+                    "w",
+                    encoding="utf-8",
+                ) as fp:
+                    fp.write(
+                        "QUESTION FAILED\n"
+                        f"question_id: {qid}\n"
+                        f"error_type: "
+                        f"{type(exc).__name__}\n"
+                        f"error: {exc}\n\n"
+                        f"{error_traceback}"
+                    )
+
+            # Preserve retrieval-file metadata in aggregate JSONL.
+            result["retrieval_metadata"] = data.get(
+                "retrieval_metadata",
+                {},
+            )
+
             results.append(result)
 
     output_path = Path(log_dir) / "predictions.jsonl"
@@ -199,7 +332,8 @@ def main(
     summary = {
         "num_results": len(results),
         "num_questions": len(subset),
-        "candidate_k": candidate_k,
+        "agent_type": agent_type,
+        "candidate_k": effective_candidate_k,
         "schema_top_k": schema_top_k,
         "selected_gold_count": sum(
             1 for r in results if r.get("selected_is_gold")
@@ -209,6 +343,7 @@ def main(
         ),
         "predictions_path": str(output_path),
     }
+
     with (Path(log_dir) / "summary.json").open("w", encoding="utf-8") as fp:
         json.dump(summary, fp, ensure_ascii=False, indent=2)
 

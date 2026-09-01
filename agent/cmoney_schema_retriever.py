@@ -22,49 +22,51 @@ from sentence_transformers import SentenceTransformer
 from agent.retriever import Retriever
 
 
-class JinaV3Embeddings(Embeddings):
-    """LangChain Embeddings adapter for jinaai/jina-embeddings-v3."""
-
+class JinaV4Embeddings(Embeddings):
     def __init__(
         self,
-        *,
-        model_name: str = "jinaai/jina-embeddings-v3",
+        model_name: str,
         device: str = "cpu",
         batch_size: int = 64,
         encode_dim: int = 1024,
-    ) -> None:
-        self.model_name = model_name
-        self.device = device
-        self.batch_size = int(batch_size)
-        self.encode_dim = int(encode_dim)
+    ):
         self.model = SentenceTransformer(
-            self.model_name,
+            model_name,
             trust_remote_code=True,
-            device=self.device,
+            device=device,
         )
+        self.device = device
+        self.batch_size = batch_size
+        self.encode_dim = encode_dim
 
-    def embed_documents(self, texts: list[str]) -> list[list[float]]:
-        if not texts:
-            return []
+    def embed_documents(
+        self,
+        texts: list[str],
+    ) -> list[list[float]]:
         vectors = self.model.encode(
-            texts,
+            sentences=texts,
+            task="retrieval",
+            prompt_name="passage",
             batch_size=self.batch_size,
-            device=self.device,
-            task="retrieval.passage",
             truncate_dim=self.encode_dim,
-            show_progress_bar=False,
+            normalize_embeddings=True,
+            convert_to_numpy=True,
         )
         return vectors.tolist()
 
-    def embed_query(self, text: str) -> list[float]:
+    def embed_query(
+        self,
+        text: str,
+    ) -> list[float]:
         vector = self.model.encode(
-            text,
-            batch_size=self.batch_size,
-            device=self.device,
-            task="retrieval.query",
+            sentences=[text],
+            task="retrieval",
+            prompt_name="query",
+            batch_size=1,
             truncate_dim=self.encode_dim,
-            show_progress_bar=False,
-        )
+            normalize_embeddings=True,
+            convert_to_numpy=True,
+        )[0]
         return vector.tolist()
 
 
@@ -116,13 +118,13 @@ class CMoneySchemaRetriever(Retriever):
         self.encode_dim = int(encode_dim)
 
         if self.mode in {"embed", "hybrid"}:
-            if self.embed_model_name != "jinaai/jina-embeddings-v3":
+            if self.embed_model_name != "jinaai/jina-embeddings-v4":
                 raise ValueError(
                     "This CMoney retriever is configured for "
-                    "jinaai/jina-embeddings-v3. Got: "
+                    "jinaai/jina-embeddings-v4. Got: "
                     f"{self.embed_model_name!r}"
                 )
-            self.embedder = JinaV3Embeddings(
+            self.embedder = JinaV4Embeddings(
                 model_name=self.embed_model_name,
                 device=self.embed_device,
                 batch_size=self.embed_batch_size,

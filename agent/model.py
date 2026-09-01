@@ -98,7 +98,10 @@ class Model:
         # vLLM models
         elif self.provider == 'vllm':
             self.client = OpenAI(
-                base_url='http://localhost:8000/v1',
+                base_url=os.getenv(
+                    'VLLM_BASE_URL',
+                    'http://localhost:8000/v1',
+                ),
                 api_key='token-abc123',
             )
             self.tokenizer = AutoTokenizer.from_pretrained(model_name)
